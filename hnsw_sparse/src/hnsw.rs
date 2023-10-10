@@ -31,11 +31,11 @@ type InternalKey = usize;
 // TODO: we should have some restrictions on K and T
 pub struct HNSWSparseIndex<K, T, D: Distance<T>> {
     // fill this in with parameters
-    // the graph itself
+    // the graph itself: this owns all the nodes!
     graph: HNSWGraph<K, T>,
     // entry point (IDK how this is set, I think I can set it)
     // Option because in new graphs it doesn't exist
-    entry_point: Option<Node<K, T>>,
+    entry_point: Option<InternalKey>,
     max_layers: usize, // m_L
     // controls how big your search is
     ef_construction: usize, // efConstruction
@@ -54,7 +54,7 @@ pub struct HNSWSparseIndex<K, T, D: Distance<T>> {
 }
 
 // TODO: concurrency
-impl<K, T, D: Distance<T>> HNSWSparseIndex<K, T, D> {
+impl<K: Copy, T, D: Distance<T>> HNSWSparseIndex<K, T, D> {
     pub fn new(
         max_layers: usize,
         ef_construction: usize,
@@ -86,8 +86,44 @@ impl<K, T, D: Distance<T>> HNSWSparseIndex<K, T, D> {
     // size of dynamic candidate list should be hidden
     // the size of the return array is dependent on k, so IDK what the right type is, AI said
     // Vec<T> or Box<[T]>
-    pub fn k_nn_search(&self, query: SparseVector<T>, k: u16) -> Vec<SparseVector<T>> {
-        Vec::new()
+    pub fn k_nn_search(&self, query: &SparseVector<T>, k: usize) -> Vec<K> {
+        if self.entry_point.is_none() {
+            // graph is empty, we have no neighbors
+            return Vec::new();
+        }
+        // running list of nearest elts
+        let mut nearest_elts;
+        // start by checking dist(query, entry_point)
+        let enter_point: &Node<K, T> = self.get_node_with_internal_id(self.entry_point.unwrap());
+        let mut enter_dist: NodeWithDistance = NodeWithDistance {
+            internal_id: enter_point.internal_id,
+            dist: self.dist_func.eval(query, &enter_point.data),
+        };
+        // we go down layers
+        // in all but the bottom layer, we only select one element (the nearest)
+        for layer in (1..=enter_point.max_layer).rev() {
+            nearest_elts = self.search_layer(query, &BinaryHeap::from([enter_dist]), 1, layer);
+            enter_dist = *nearest_elts.peek().unwrap();
+        }
+        // in the bottom layer, we finally actually find the ef_construction nearest elements
+        nearest_elts = self.search_layer(
+            query,
+            &BinaryHeap::from([enter_dist]),
+            self.ef_construction,
+            0,
+        );
+        // get only the nearest k elements
+        let mut k_nearest: Vec<K> = Vec::with_capacity(k);
+        for i in 0..k {
+            let nearest = nearest_elts.pop();
+            if nearest.is_none() {
+                // no more elements! we're done
+                break;
+            }
+            let nearest_node = self.get_node_with_internal_id(nearest.unwrap().internal_id);
+            k_nearest[i] = nearest_node.external_id;
+        }
+        k_nearest
     }
 
     // TODO: THIS SHOULD BE AN OPTION OR PANIC
@@ -105,6 +141,11 @@ impl<K, T, D: Distance<T>> HNSWSparseIndex<K, T, D> {
     // TODO: usize -> custom type
     // search layer is internal, so it only needs to use internal IDs
     // we use a heap because sorting
+    // tl;dr for search on a specific layer: we start with a list of candidates (enter_points) of
+    // neighbors and we improve this list by repeatedly checking if anything in the neighborhood of the
+    // candidates is closer than the current neighbor list
+    // this returns a binary heap of nodes with at most num_neighbors nodes
+    // TODO: add some asserts
     fn search_layer(
         &self,
         query: &SparseVector<T>,
