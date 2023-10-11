@@ -1,3 +1,4 @@
+use std::cmp::min;
 use std::cmp::Ordering;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -8,7 +9,6 @@ use std::collections::HashSet;
 // an hnsw index is parametrized by its vector type T and a distance function D
 // we are interested in sparse vectors, so T will be a list of (id, value) pairs and D will be
 // cosine similarity
-// alternately, we could only think about sparse vectors, so T is the type of data the vector holds
 
 pub trait Distance<T> {
     fn eval(&self, v1: &SparseVector<T>, v2: &SparseVector<T>) -> f32;
@@ -33,7 +33,7 @@ pub struct HNSWSparseIndex<K, T, D: Distance<T>> {
     // fill this in with parameters
     // the graph itself: this owns all the nodes!
     graph: HNSWGraph<K, T>,
-    // entry point (IDK how this is set, I think I can set it)
+    // entry point
     // Option because in new graphs it doesn't exist
     entry_point: Option<InternalKey>,
     max_layers: usize, // m_L
@@ -215,17 +215,77 @@ impl<K: Copy, T, D: Distance<T>> HNSWSparseIndex<K, T, D> {
         neighbors.iter().map(|x| x.0).collect()
     }
 
+    // this is the select_neighbors_heurisitc from the paper, not the greedy version
+    // we don't care about distances from base in the returned list of neighbors
+    // TODO: should base be a vector, an ID, a node, or what? right now it's a vector
+    // because base is only used if we want to extend our candidates
     fn select_neighbors(
         &self,
-        base: Node<K, T>,
+        base: &SparseVector<T>,
         candidates: BinaryHeap<NodeWithDistance>,
-        num_neigbors: u16,
+        num_neighbors: usize,
         layer_number: usize,
-        extend_candidates: bool,
-        keep_pruned: bool,
-    ) -> BinaryHeap<NodeWithDistance> {
-        BinaryHeap::new()
-    }
+    ) -> Vec<InternalKey> {
+        let mut working: BinaryHeap<NodeWithDistance> = candidates.clone();
+        // we might add back some discarded candidates, so we keep track of them
+        let mut discarded: BinaryHeap<NodeWithDistance> = BinaryHeap::new();
+        // TODO: better way than "reverse"?
+        let mut neighbors: Vec<InternalKey> = Vec::with_capacity(num_neighbors);
+        // extend_candidates flag controls whether we add neighbors of candidates to candidates
+        // paper says this should only be turned on if we expect data to be very clustered
+        if self.extend_candidates {
+            // make a hash set of the IDs
+            let mut visited: HashSet<InternalKey> =
+                candidates.iter().map(|&x| x.internal_id).collect();
+            // add neighbors of candidates to the working queue
+            // TODO: check layer number is valid
+            for e in candidates.iter() {
+                for e_adj in
+                    self.get_node_with_internal_id(e.internal_id).neighbors[layer_number].iter()
+                {
+                    // no duplicates!
+                    if !visited.contains(&e_adj.internal_id) {
+                        working.push(NodeWithDistance {
+                            internal_id: e_adj.internal_id,
+                            dist: self.dist_func.eval(base, &e_adj.data),
+                        });
+                        visited.insert(e_adj.internal_id);
+                    }
+                }
+            }
+        } // end extend candidates
+          // now select some neighbors from the candidates
+        while !working.is_empty() && neighbors.len() < num_neighbors {
+            let e: NodeWithDistance = working.pop().unwrap();
+            // check distance from e to each possible neighbor
+            let mut discard: bool = false;
+            for &n in neighbors.iter() {
+                // if e is closer to a neighbor, discard = true
+                let e_n_dist: f32 = self.dist_func.eval(
+                    &self.get_node_with_internal_id(e.internal_id).data,
+                    &self.get_node_with_internal_id(n).data,
+                );
+                if e_n_dist < e.dist {
+                    discard = true;
+                }
+            }
+            if discard {
+                discarded.push(e);
+            } else {
+                neighbors.push(e.internal_id);
+            }
+        } // end neighbor selection
+          // add pruned connections if needed: goal is to return as close to num_neighbors neighbors
+          // as possible
+        if self.keep_pruned {
+            // add min(num_neighbors - neighbors.len(), discarded.len()) elts to neighbors
+            let num_to_add: usize = min(num_neighbors - neighbors.len(), discarded.len());
+            for _ in 0..num_to_add {
+                neighbors.push(discarded.pop().unwrap().internal_id);
+            }
+        } // end restoring pruned connections
+        neighbors
+    } // end select_neighbors
 }
 
 // a graph is an array of nodes
