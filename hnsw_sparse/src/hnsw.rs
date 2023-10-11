@@ -5,12 +5,14 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::hash::Hash;
+use std::marker::PhantomData;
 // most basic API
 
 // cosine similarity for sparse vectors
 type DistType = f64;
 // apparently a way to allow multiple distance implementations for the same type
-trait Dist {}
+pub trait Dist {}
 struct CosSim;
 impl Dist for CosSim {}
 
@@ -30,7 +32,7 @@ trait Normed {
 impl Normed for SparseVector {
     fn norm(&self) -> DistType {
         self.iter()
-            .fold(0.0, |acc, (_, &val)| acc + val * val)
+            .fold(0.0, |acc, (_, val)| acc + val * val)
             .sqrt()
     }
 }
@@ -38,7 +40,7 @@ impl Normed for SparseVector {
 // d = 1.0 - sum(Ai*Bi) / sqrt(sum(Ai*Ai) * sum(Bi*Bi))
 impl Distance<CosSim> for SparseVector {
     fn dist(&self, other: &Self) -> DistType {
-        let accum: DistType = 0.0;
+        let mut accum: DistType = 0.0;
         // because both are sorted, it's easy to do sorted set intersection
         let mut v1 = self.iter().peekable();
         let mut v2 = other.iter().peekable();
@@ -128,6 +130,22 @@ impl<K, D> Node<K, D> {
             neighbors: Vec::with_capacity(max_layer),
         }
     }
+
+    fn new_with_neighbors(
+        data: D,
+        internal_id: InternalKey,
+        max_layer: usize,
+        external_id: K,
+        neighbors: Vec<NeighborLayer>,
+    ) -> Self {
+        Node {
+            data: data,
+            internal_id: internal_id,
+            max_layer: max_layer,
+            external_id: external_id,
+            neighbors: neighbors,
+        }
+    }
 }
 
 type HNSWGraph<K, D> = HashMap<InternalKey, Node<K, D>>;
@@ -137,7 +155,7 @@ type InternalKey = usize;
 // D is any data with a distance function (we care about SparseVector)
 // K is the type for user-provided IDs
 // TODO: this is not compiling because O is unused apparently
-pub struct HNSWSparseIndex<O: Dist, K: Copy, D: Distance<O>> {
+pub struct HNSWIndex<K, D, O> {
     // fill this in with parameters
     // the graph itself: this owns all the nodes!
     graph: HNSWGraph<K, D>,
@@ -160,10 +178,16 @@ pub struct HNSWSparseIndex<O: Dist, K: Copy, D: Distance<O>> {
     // distance function for nodes
     curr_internal_id: InternalKey,
     ext_to_int_id: HashMap<K, InternalKey>,
+    dist_type: PhantomData<O>,
 }
 
 // TODO: concurrency
-impl<O: Dist, K: Copy, D: Distance<O>> HNSWSparseIndex<O, K, D> {
+impl<K, D, O> HNSWIndex<K, D, O>
+where
+    O: Dist,
+    K: Hash + Eq + Copy,
+    D: Distance<O>,
+{
     pub fn new(
         max_layers: usize,
         ef_construction: usize,
@@ -174,9 +198,8 @@ impl<O: Dist, K: Copy, D: Distance<O>> HNSWSparseIndex<O, K, D> {
         keep_pruned: bool,
     ) -> Self {
         // TODO: is this correct rust syntax lol
-        let graph = HNSWGraph::<K, D>::new();
-        HNSWSparseIndex {
-            graph: graph,
+        HNSWIndex {
+            graph: HNSWGraph::<K, D>::new(),
             entry_point: None,
             max_layers: max_layers,
             ef_construction: ef_construction,
@@ -186,8 +209,10 @@ impl<O: Dist, K: Copy, D: Distance<O>> HNSWSparseIndex<O, K, D> {
             extend_candidates: extend_candidates,
             keep_pruned: keep_pruned,
             curr_internal_id: 0,
+            ext_to_int_id: HashMap::<K, InternalKey>::new(),
+            dist_type: PhantomData,
         }
-    }
+    } // end new
 
     fn rand_layer(&self) -> usize {
         let mut rng = rand::thread_rng();
@@ -205,11 +230,11 @@ impl<O: Dist, K: Copy, D: Distance<O>> HNSWSparseIndex<O, K, D> {
     pub fn insert(&mut self, external_id: K, v: D) {
         let ins_layer: usize = self.rand_layer();
         let id: InternalKey = self.next_internal_id();
-        let mut new_node: Node<K, D> = Node::new(v, id, ins_layer, external_id);
         self.ext_to_int_id.insert(external_id, id);
         // the really dumb case: empty graph
         // there are no connections to make, so we just set the entry point and finish
         if self.entry_point.is_none() {
+            let new_node: Node<K, D> = Node::new(v, id, ins_layer, external_id);
             self.graph.insert(id, new_node);
             self.entry_point = Some(id);
             return;
@@ -229,6 +254,7 @@ impl<O: Dist, K: Copy, D: Distance<O>> HNSWSparseIndex<O, K, D> {
         for curr_layer in (ins_layer..=self.max_layers).rev() {
             nearest = self.search_layer(&v, &nearest, 1, curr_layer);
         }
+        let mut neighbor_vec = Vec::<NeighborLayer>::with_capacity(ins_layer);
         // then from ins_layer to 0, we need to give our node connections!
         for curr_layer in (0..=ins_layer).rev() {
             let max_neighbors: usize = if curr_layer == 0 {
@@ -242,13 +268,12 @@ impl<O: Dist, K: Copy, D: Distance<O>> HNSWSparseIndex<O, K, D> {
             let neighbors: Vec<InternalKey> =
                 self.select_neighbors(&v, &nearest, self.num_insert_neighbors, curr_layer);
             // add each other as neighbors!
-            // easy for the new node
-            new_node.neighbors[curr_layer] = HashSet::from_iter(neighbors);
             // for everyone else
             for &n in neighbors.iter() {
                 // first add bidirectional connections
-                let n_node: Node<K, D> = self.get_node_with_internal_id(n);
-                n_node.neighbors[curr_layer].insert(id);
+                // TODO: i did this to obey the borrow checker
+                self.get_mut_node_with_internal_id(n).neighbors[curr_layer].insert(id);
+                let n_node: &Node<K, D> = self.get_node_with_internal_id(n);
                 // now shrink connections if needed
                 if n_node.neighbors[curr_layer].len() > max_neighbors {
                     let n_data: &D = &n_node.data;
@@ -266,14 +291,17 @@ impl<O: Dist, K: Copy, D: Distance<O>> HNSWSparseIndex<O, K, D> {
                         self.select_neighbors(n_data, &n_old_neighbors, max_neighbors, curr_layer);
                     // TODO: prune any connections between n and discarded? This is not mentioned
                     // in the paper, but I would assume the graph is bidirectional
-                    // TODO: idk if this will help the borrowing
-                    // but this is the only mutable borrow of self now
                     self.get_mut_node_with_internal_id(n).neighbors[curr_layer] =
                         HashSet::from_iter(n_new_neighbors);
                 } // end shrink connections for neighbors
-            } // end adding connections on layer l
+            } // end adding connections for new neighbors
+              // easy for the new node
+            neighbor_vec[curr_layer] = HashSet::from_iter(neighbors.clone());
         } // end connection-building for layers l to 0
-          // add our node to the graph!
+
+        // add our node to the graph!
+        let new_node: Node<K, D> =
+            Node::new_with_neighbors(v, id, ins_layer, external_id, neighbor_vec);
         self.graph.insert(id, new_node);
         // make it entry point if needed!
         if ins_layer > entry_layer {
@@ -322,7 +350,7 @@ impl<O: Dist, K: Copy, D: Distance<O>> HNSWSparseIndex<O, K, D> {
             k_nearest[i] = nearest_node.external_id;
         }
         k_nearest
-    }
+    } // end k nearest neighbor search
 
     // TODO: THIS SHOULD BE AN OPTION OR PANIC
     fn get_node_with_internal_id(&self, internal_id: InternalKey) -> &Node<K, D> {
@@ -489,4 +517,4 @@ impl<O: Dist, K: Copy, D: Distance<O>> HNSWSparseIndex<O, K, D> {
         } // end restoring pruned connections
         neighbors
     } // end select_neighbors
-} // end HNSWSparseIndex implementation
+} // end HNSWIndex implementation
