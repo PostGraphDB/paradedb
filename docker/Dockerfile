@@ -4,14 +4,13 @@ ARG PG_VERSION_MAJOR
 # First Stage: Base
 ###############################################
 
-FROM postgres:${PG_VERSION_MAJOR}-bullseye as base
+FROM postgres:${PG_VERSION_MAJOR}-bookworm as base
 
 # Declare all the build arguments and set them to
 # environment variables for use in build and runtime
 ARG PG_VERSION_MAJOR
 ARG PG_BM25_VERSION
 ARG PG_SEARCH_VERSION
-ARG PGNODEMX_VERSION
 ARG PG_CRON_VERSION
 ARG PG_NET_VERSION
 ARG PG_IVM_VERSION
@@ -34,10 +33,13 @@ ARG HYPOPG_VERSION
 ARG RUM_VERSION
 ARG AGE_VERSION
 
+ARG USE_CRUNCHY
+ARG PGNODEMX_VERSION
+ARG BACKREST_VERSION
+
 ENV PG_VERSION_MAJOR=${PG_VERSION_MAJOR} \
     PG_BM25_VERSION=${PG_BM25_VERSION} \
     PG_SEARCH_VERSION=${PG_SEARCH_VERSION} \
-    PGNODEMX_VERSION=${PGNODEMX_VERSION} \
     PG_CRON_VERSION=${PG_CRON_VERSION} \
     PG_NET_VERSION=${PG_NET_VERSION} \
     PG_IVM_VERSION=${PG_IVM_VERSION} \
@@ -60,7 +62,10 @@ ENV PG_VERSION_MAJOR=${PG_VERSION_MAJOR} \
     RUM_VERSION=${RUM_VERSION} \
     AGE_VERSION=${AGE_VERSION} \
     DEBIAN_FRONTEND=noninteractive \
-    TZ=UTC
+    TZ=UTC \
+    PGNODEMX_VERSION=${PGNODEMX_VERSION} \
+    USE_CRUNCHY=${USE_CRUNCHY} \
+    BACKREST_VERSION=${BACKREST_VERSION}
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
@@ -216,7 +221,6 @@ COPY scripts/install_pg_extensions.sh /usr/local/bin/
 RUN /usr/local/bin/install_pg_extensions.sh \
     "pgvector,${PGVECTOR_VERSION},https://github.com/pgvector/pgvector/archive/refs/tags/v${PGVECTOR_VERSION}.tar.gz" \
     "pgaudit,${PGAUDIT_VERSION},https://github.com/pgaudit/pgaudit/archive/refs/tags/${PGAUDIT_VERSION}.tar.gz" \
-    "pgnodemx,${PGNODEMX_VERSION},https://github.com/crunchydata/pgnodemx/archive/refs/tags/${PGNODEMX_VERSION}.tar.gz" \
     "pg_cron,${PG_CRON_VERSION},https://github.com/citusdata/pg_cron/archive/refs/tags/v${PG_CRON_VERSION}.tar.gz" \
     "pg_ivm,${PG_IVM_VERSION},https://github.com/sraoss/pg_ivm/archive/refs/tags/v${PG_IVM_VERSION}.tar.gz" \
     "pg_hashids,${PG_HASHIDS_VERSION},https://github.com/iCyberon/pg_hashids/archive/refs/tags/v${PG_HASHIDS_VERSION}.tar.gz" \
@@ -231,7 +235,8 @@ RUN /usr/local/bin/install_pg_extensions.sh \
     "pgsql-http,${PGSQL_HTTP_VERSION},https://github.com/pramsey/pgsql-http/archive/refs/tags/v${PGSQL_HTTP_VERSION}.tar.gz" \
     "hypopg,${HYPOPG_VERSION},https://github.com/HypoPG/hypopg/archive/refs/tags/${HYPOPG_VERSION}.tar.gz" \
     "rum,${RUM_VERSION},https://github.com/postgrespro/rum/archive/refs/tags/${RUM_VERSION}.tar.gz" \
-    "age,${AGE_VERSION},https://github.com/apache/age/archive/refs/tags/PG${PG_VERSION_MAJOR}/v${AGE_VERSION}.tar.gz"
+    "age,${AGE_VERSION},https://github.com/apache/age/archive/refs/tags/PG${PG_VERSION_MAJOR}/v${AGE_VERSION}.tar.gz" \
+    "pgnodemx,${PGNODEMX_VERSION},https://github.com/crunchydata/pgnodemx/archive/refs/tags/${PGNODEMX_VERSION}.tar.gz"
 
 # Install pre-compiled extensions
 RUN curl -L "https://github.com/supabase/pg_net/releases/download/v${PG_NET_VERSION}/pg_net-v${PG_NET_VERSION}-pg${PG_VERSION_MAJOR}-$TARGETARCH-linux-gnu.deb" -o /tmp/pg_net.deb && \
@@ -285,6 +290,14 @@ COPY --from=builder-pg_search /tmp/pg_search/target/release/pg_search-pg${PG_VER
 COPY --from=builder-pg_search /tmp/pg_search/target/release/pg_search-pg${PG_VERSION_MAJOR}/usr/lib/postgresql/${PG_VERSION_MAJOR}/lib/* /usr/lib/postgresql/${PG_VERSION_MAJOR}/lib/
 COPY --from=builder-pg_bm25 /tmp/pg_bm25/target/release/pg_bm25-pg${PG_VERSION_MAJOR}/usr/share/postgresql/${PG_VERSION_MAJOR}/extension/* /usr/share/postgresql/${PG_VERSION_MAJOR}/extension/
 COPY --from=builder-pg_bm25 /tmp/pg_bm25/target/release/pg_bm25-pg${PG_VERSION_MAJOR}/usr/lib/postgresql/${PG_VERSION_MAJOR}/lib/* /usr/lib/postgresql/${PG_VERSION_MAJOR}/lib/
+
+# Setup Crunchy if enabled
+COPY scripts/setup_crunchy.sh /usr/local/bin/
+COPY docker/crunchy/bin/ /tmp/crunchy/bin/
+COPY docker/crunchy/conf/postgres_common /tmp/crunchy/conf/
+
+RUN /usr/local/bin/setup_crunchy.sh \
+    && rm -rf /tmp/*
 
 # Copy entrypoint script, which will be handled by the official image
 # initialization scipt
