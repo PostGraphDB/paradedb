@@ -25,19 +25,19 @@ pub trait Distance<T: Dist> {
 // sparse vector
 // for now, let's say it's just an alias for Vec: a sorted list of (id, value) pairs
 // we can think about whether that will make sorting hard later
-type SparseVector<T> = Vec<(usize, T)>;
+type SparseVector = Vec<(usize, f64)>;
 
 trait Normed {
     fn norm(&self) -> DistType;
 }
 
-impl<T> Normed for SparseVector<T> {
+impl Normed for SparseVector {
     fn norm(&self) -> DistType {
         self.iter().fold(0.0, |acc, (_, &val)| acc + val*val).sqrt()
     }
 }
 
-impl<T> Distance<CosSim> for SparseVector<T> where T: std::ops::Mul + std::ops::Add {
+impl Distance<CosSim> for SparseVector {
     fn dist(&self, other: &Self) -> DistType {
         let accum : DistType = 0.0;
         // because both are sorted, it's easy to do sorted set intersection
