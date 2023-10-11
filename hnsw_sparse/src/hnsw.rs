@@ -29,14 +29,16 @@ trait Normed {
 
 impl Normed for SparseVector {
     fn norm(&self) -> DistType {
-        self.iter().fold(0.0, |acc, (_, &val)| acc + val*val).sqrt()
+        self.iter()
+            .fold(0.0, |acc, (_, &val)| acc + val * val)
+            .sqrt()
     }
 }
 
 // d = 1.0 - sum(Ai*Bi) / sqrt(sum(Ai*Ai) * sum(Bi*Bi))
 impl Distance<CosSim> for SparseVector {
     fn dist(&self, other: &Self) -> DistType {
-        let accum : DistType = 0.0;
+        let accum: DistType = 0.0;
         // because both are sorted, it's easy to do sorted set intersection
         let mut v1 = self.iter().peekable();
         let mut v2 = other.iter().peekable();
@@ -54,7 +56,7 @@ impl Distance<CosSim> for SparseVector {
             } else {
                 v2.next();
             }
-        } 
+        }
         1.0 - accum / (self.norm() * other.norm())
     }
 }
@@ -157,7 +159,7 @@ pub struct HNSWSparseIndex<O: Dist, K: Copy, D: Distance<O>> {
     keep_pruned: bool, // keepPrunedConnections
     // distance function for nodes
     curr_internal_id: InternalKey,
-    ext_to_int_id : HashMap<K, InternalKey>,
+    ext_to_int_id: HashMap<K, InternalKey>,
 }
 
 // TODO: concurrency
@@ -199,8 +201,7 @@ impl<O: Dist, K: Copy, D: Distance<O>> HNSWSparseIndex<O, K, D> {
     }
 
     // TODO: this isn't building because I am borrowing self as mutable (when I update neighbors)
-    // as well as immutable :( 
-    // Apparently I can fix this using reference counting
+    // as well as immutable later on
     pub fn insert(&mut self, external_id: K, v: D) {
         let ins_layer: usize = self.rand_layer();
         let id: InternalKey = self.next_internal_id();
@@ -217,8 +218,8 @@ impl<O: Dist, K: Copy, D: Distance<O>> HNSWSparseIndex<O, K, D> {
 
         // convert entry_point into a NodeWithDistance
         let entry_id: InternalKey = self.entry_point.unwrap();
-        let entry_node : &Node<K, D> = self.get_node_with_internal_id(entry_id);
-        let entry_layer : usize = entry_node.max_layer;
+        let entry_node: &Node<K, D> = self.get_node_with_internal_id(entry_id);
+        let entry_layer: usize = entry_node.max_layer;
         let entry_dist = NodeWithDistance {
             internal_id: entry_id,
             dist: v.dist(&entry_node.data),
@@ -246,7 +247,7 @@ impl<O: Dist, K: Copy, D: Distance<O>> HNSWSparseIndex<O, K, D> {
             // for everyone else
             for &n in neighbors.iter() {
                 // first add bidirectional connections
-                let n_node : &mut Node<K, D> = self.get_mut_node_with_internal_id(n);
+                let n_node: Node<K, D> = self.get_node_with_internal_id(n);
                 n_node.neighbors[curr_layer].insert(id);
                 // now shrink connections if needed
                 if n_node.neighbors[curr_layer].len() > max_neighbors {
@@ -265,11 +266,14 @@ impl<O: Dist, K: Copy, D: Distance<O>> HNSWSparseIndex<O, K, D> {
                         self.select_neighbors(n_data, &n_old_neighbors, max_neighbors, curr_layer);
                     // TODO: prune any connections between n and discarded? This is not mentioned
                     // in the paper, but I would assume the graph is bidirectional
-                    n_node.neighbors[curr_layer] = HashSet::from_iter(n_new_neighbors);
+                    // TODO: idk if this will help the borrowing
+                    // but this is the only mutable borrow of self now
+                    self.get_mut_node_with_internal_id(n).neighbors[curr_layer] =
+                        HashSet::from_iter(n_new_neighbors);
                 } // end shrink connections for neighbors
             } // end adding connections on layer l
         } // end connection-building for layers l to 0
-        // add our node to the graph!
+          // add our node to the graph!
         self.graph.insert(id, new_node);
         // make it entry point if needed!
         if ins_layer > entry_layer {
@@ -325,9 +329,9 @@ impl<O: Dist, K: Copy, D: Distance<O>> HNSWSparseIndex<O, K, D> {
         // right now, just check our big graph vec
         return self.graph.get(&internal_id).unwrap();
     }
-    
+
     // get node but it's mutable
-    fn get_mut_node_with_internal_id(&mut self, internal_id : InternalKey) -> &mut Node<K, D> {
+    fn get_mut_node_with_internal_id(&mut self, internal_id: InternalKey) -> &mut Node<K, D> {
         return self.graph.get_mut(&internal_id).unwrap();
     }
 
@@ -486,4 +490,3 @@ impl<O: Dist, K: Copy, D: Distance<O>> HNSWSparseIndex<O, K, D> {
         neighbors
     } // end select_neighbors
 } // end HNSWSparseIndex implementation
-
