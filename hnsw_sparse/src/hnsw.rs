@@ -7,11 +7,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 // most basic API
 
-// uh somewhere we also need to worry about the type of data the vector holds (probably floats)
-// an hnsw index is parametrized by its vector type T and a distance function D
-// we are interested in sparse vectors, so T will be a list of (id, value) pairs and D will be
-// cosine similarity
-
+// cosine similarity for sparse vectors
 type DistType = f64;
 // apparently a way to allow multiple distance implementations for the same type
 trait Dist {}
@@ -37,6 +33,7 @@ impl Normed for SparseVector {
     }
 }
 
+// d = 1.0 - sum(Ai*Bi) / sqrt(sum(Ai*Ai) * sum(Bi*Bi))
 impl Distance<CosSim> for SparseVector {
     fn dist(&self, other: &Self) -> DistType {
         let accum : DistType = 0.0;
@@ -62,15 +59,83 @@ impl Distance<CosSim> for SparseVector {
     }
 }
 
-// d = 1.0 - sum(Ai*Bi) / sqrt(sum(Ai*Ai) * sum(Bi*Bi))
+// a graph is an array of nodes
+// nodes have an internal_id, an external_id, the vector, and their neighbors
+// nodes are identified by internal_id
+// but API users use external_id
+// node neighbors are an array of L "neighbors per layer"
 
+// the node's internal ID is just its index in the array
+// but the external ID is separate
+// for deletions, we might need something fancier, unclear
 
+// the hnsw algorithm only cares about neighbors per layer
+// so we don't need to keep track of which nodes are on which layer
+// it's enough to know the entry point
+
+// "node with distance" is used to make searching easier
+// the point we are taking distance relative to is not stored
+#[derive(PartialEq, Copy, Clone)]
+struct NodeWithDistance {
+    internal_id: InternalKey,
+    dist: DistType,
+}
+
+// careful because can be nan()
+// floats only implement PartialOrd and PartialEq
+// note that in order to make our binary heaps sort by min distance, we reverse the ordering
+impl PartialOrd for NodeWithDistance {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        other.dist.partial_cmp(&self.dist)
+    }
+}
+
+impl Ord for NodeWithDistance {
+    fn cmp(&self, other: &Self) -> Ordering {
+        if self.dist.is_nan() || other.dist.is_nan() {
+            panic!("distance for node {} is NaN", self.internal_id);
+        } else {
+            other.partial_cmp(&self).unwrap()
+        }
+    }
+}
+
+// TODO: hnswlib-rs just makes Eq blank
+impl Eq for NodeWithDistance {}
+
+// NOTE: we should never be cloning or copying nodes.
+// we should touch nodes.neighbors
+// but all other parts of Node should be created during insertion and only read afterwards
+struct Node<K, D> {
+    data: D,
+    internal_id: InternalKey,
+    // the layer is used when we want to adjust entry point (maybe)
+    max_layer: usize,
+    external_id: K,
+    // one neighbor list per layer
+    neighbors: Vec<NeighborLayer>,
+}
+
+impl<K, D> Node<K, D> {
+    fn new(data: D, internal_id: InternalKey, max_layer: usize, external_id: K) -> Self {
+        Node {
+            data: data,
+            internal_id: internal_id,
+            max_layer: max_layer,
+            external_id: external_id,
+            neighbors: Vec::with_capacity(max_layer),
+        }
+    }
+}
+
+type HNSWGraph<K, D> = HashMap<InternalKey, Node<K, D>>;
+type NeighborLayer = HashSet<InternalKey>;
 type InternalKey = usize;
 
 // D is any data with a distance function (we care about SparseVector)
 // K is the type for user-provided IDs
-// TODO: we should have some restrictions on K and T
-pub struct HNSWSparseIndex<K, D> {
+// TODO: this is not compiling because O is unused apparently
+pub struct HNSWSparseIndex<O: Dist, K: Copy, D: Distance<O>> {
     // fill this in with parameters
     // the graph itself: this owns all the nodes!
     graph: HNSWGraph<K, D>,
@@ -92,10 +157,11 @@ pub struct HNSWSparseIndex<K, D> {
     keep_pruned: bool, // keepPrunedConnections
     // distance function for nodes
     curr_internal_id: InternalKey,
+    ext_to_int_id : HashMap<K, InternalKey>,
 }
 
 // TODO: concurrency
-impl<O: Dist, K: Copy, D: Distance<O>> HNSWSparseIndex<K, D> {
+impl<O: Dist, K: Copy, D: Distance<O>> HNSWSparseIndex<O, K, D> {
     pub fn new(
         max_layers: usize,
         ef_construction: usize,
@@ -139,9 +205,11 @@ impl<O: Dist, K: Copy, D: Distance<O>> HNSWSparseIndex<K, D> {
         let ins_layer: usize = self.rand_layer();
         let id: InternalKey = self.next_internal_id();
         let mut new_node: Node<K, D> = Node::new(v, id, ins_layer, external_id);
+        self.ext_to_int_id.insert(external_id, id);
         // the really dumb case: empty graph
         // there are no connections to make, so we just set the entry point and finish
         if self.entry_point.is_none() {
+            self.graph.insert(id, new_node);
             self.entry_point = Some(id);
             return;
         }
@@ -149,9 +217,11 @@ impl<O: Dist, K: Copy, D: Distance<O>> HNSWSparseIndex<K, D> {
 
         // convert entry_point into a NodeWithDistance
         let entry_id: InternalKey = self.entry_point.unwrap();
+        let entry_node : &Node<K, D> = self.get_node_with_internal_id(entry_id);
+        let entry_layer : usize = entry_node.max_layer;
         let entry_dist = NodeWithDistance {
             internal_id: entry_id,
-            dist: v.dist(&self.get_node_with_internal_id(entry_id).data),
+            dist: v.dist(&entry_node.data),
         };
         let mut nearest: BinaryHeap<NodeWithDistance> = BinaryHeap::from([entry_dist]);
         // on the layers atop ins_layer, just find one element
@@ -160,6 +230,11 @@ impl<O: Dist, K: Copy, D: Distance<O>> HNSWSparseIndex<K, D> {
         }
         // then from ins_layer to 0, we need to give our node connections!
         for curr_layer in (0..=ins_layer).rev() {
+            let max_neighbors: usize = if curr_layer == 0 {
+                self.max_neighbors
+            } else {
+                self.max_neighbors_0
+            };
             // find ef_construction nearest elements
             nearest = self.search_layer(&v, &nearest, self.ef_construction, curr_layer);
             // from those, select neighbors
@@ -170,13 +245,9 @@ impl<O: Dist, K: Copy, D: Distance<O>> HNSWSparseIndex<K, D> {
             new_node.neighbors[curr_layer] = HashSet::from_iter(neighbors);
             // for everyone else
             for &n in neighbors.iter() {
+                // first add bidirectional connections
                 let n_node : &mut Node<K, D> = self.get_mut_node_with_internal_id(n);
                 n_node.neighbors[curr_layer].insert(id);
-                let max_neighbors: usize = if curr_layer == 0 {
-                    self.max_neighbors
-                } else {
-                    self.max_neighbors_0
-                };
                 // now shrink connections if needed
                 if n_node.neighbors[curr_layer].len() > max_neighbors {
                     let n_data: &D = &n_node.data;
@@ -200,6 +271,10 @@ impl<O: Dist, K: Copy, D: Distance<O>> HNSWSparseIndex<K, D> {
         } // end connection-building for layers l to 0
         // add our node to the graph!
         self.graph.insert(id, new_node);
+        // make it entry point if needed!
+        if ins_layer > entry_layer {
+            self.entry_point = Some(id);
+        }
     } // end insert
 
     // size of dynamic candidate list should be hidden
@@ -410,76 +485,5 @@ impl<O: Dist, K: Copy, D: Distance<O>> HNSWSparseIndex<K, D> {
         } // end restoring pruned connections
         neighbors
     } // end select_neighbors
-}
+} // end HNSWSparseIndex implementation
 
-// a graph is an array of nodes
-// nodes have an internal_id, an external_id, the vector, and their neighbors
-// nodes are identified by internal_id
-// but API users use external_id
-// node neighbors are an array of L "neighbors per layer"
-
-// the node's internal ID is just its index in the array
-// but the external ID is separate
-// for deletions, we might need something fancier, unclear
-
-// the hnsw algorithm only cares about neighbors per layer
-// so we don't need to keep track of which nodes are on which layer
-// it's enough to know the entry point
-
-// "node with distance" is used to make searching easier
-// the point we are taking distance relative to is not stored
-#[derive(PartialEq, Copy, Clone)]
-struct NodeWithDistance {
-    internal_id: InternalKey,
-    dist: DistType,
-}
-
-// careful because can be nan()
-// floats only implement PartialOrd and PartialEq
-// note that in order to make our binary heaps sort by min distance, we reverse the ordering
-impl PartialOrd for NodeWithDistance {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        other.dist.partial_cmp(&self.dist)
-    }
-}
-
-impl Ord for NodeWithDistance {
-    fn cmp(&self, other: &Self) -> Ordering {
-        if self.dist.is_nan() || other.dist.is_nan() {
-            panic!("distance for node {} is NaN", self.internal_id);
-        } else {
-            other.partial_cmp(&self).unwrap()
-        }
-    }
-}
-
-// TODO: hnswlib-rs just makes Eq blank
-impl Eq for NodeWithDistance {}
-
-// NOTE: we should never be cloning or copying nodes.
-// we should touch nodes.neighbors
-// but all other parts of Node should be created during insertion and only read afterwards
-struct Node<K, D> {
-    data: D,
-    internal_id: InternalKey,
-    // the layer is used when we want to adjust entry point (maybe)
-    max_layer: usize,
-    external_id: K,
-    // one neighbor list per layer
-    neighbors: Vec<NeighborLayer>,
-}
-
-impl<K, D> Node<K, D> {
-    fn new(data: D, internal_id: InternalKey, max_layer: usize, external_id: K) -> Self {
-        Node {
-            data: data,
-            internal_id: internal_id,
-            max_layer: max_layer,
-            external_id: external_id,
-            neighbors: Vec::with_capacity(max_layer),
-        }
-    }
-}
-
-type HNSWGraph<K, D> = HashMap<InternalKey, Node<K, D>>;
-type NeighborLayer = HashSet<InternalKey>;
