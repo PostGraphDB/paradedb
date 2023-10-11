@@ -13,8 +13,12 @@ use std::collections::HashSet;
 // cosine similarity
 
 type DistType = f64;
+// apparently a way to allow multiple distance implementations for the same type
+trait Dist {}
+struct CosSim;
+impl Dist for CosSim {}
 
-pub trait Distance {
+pub trait Distance<T: Dist> {
     fn dist(&self, other: &Self) -> DistType;
 }
 
@@ -23,9 +27,43 @@ pub trait Distance {
 // we can think about whether that will make sorting hard later
 type SparseVector<T> = Vec<(usize, T)>;
 
-pub struct CosineSimilarity;
+trait Normed {
+    fn norm(&self) -> DistType;
+}
+
+impl<T> Normed for SparseVector<T> {
+    fn norm(&self) -> DistType {
+        self.iter().fold(0.0, |acc, (_, &val)| acc + val*val).sqrt()
+    }
+}
+
+impl<T> Distance<CosSim> for SparseVector<T> where T: std::ops::Mul + std::ops::Add {
+    fn dist(&self, other: &Self) -> DistType {
+        let accum : DistType = 0.0;
+        // because both are sorted, it's easy to do sorted set intersection
+        let mut v1 = self.iter().peekable();
+        let mut v2 = other.iter().peekable();
+        // compare v1.peek() and v2.peek()
+        // if they're the same, they go in intersection
+        // if v1 < v2, advance v1
+        // if v2 > v1, advance v2
+        while !(v1.peek().is_none() || v2.peek().is_none()) {
+            let w1 = v1.peek().unwrap();
+            let w2 = v2.peek().unwrap();
+            if w1.0 == w2.0 {
+                accum += w1.1 * w2.1;
+            } else if w1.0 < w2.0 {
+                v1.next();
+            } else {
+                v2.next();
+            }
+        } 
+        1.0 - accum / (self.norm() * other.norm())
+    }
+}
 
 // d = 1.0 - sum(Ai*Bi) / sqrt(sum(Ai*Ai) * sum(Bi*Bi))
+
 
 type InternalKey = usize;
 
@@ -57,7 +95,7 @@ pub struct HNSWSparseIndex<K, D> {
 }
 
 // TODO: concurrency
-impl<K: Copy, D: Distance> HNSWSparseIndex<K, D> {
+impl<O: Dist, K: Copy, D: Distance<O>> HNSWSparseIndex<K, D> {
     pub fn new(
         max_layers: usize,
         ef_construction: usize,
@@ -68,7 +106,7 @@ impl<K: Copy, D: Distance> HNSWSparseIndex<K, D> {
         keep_pruned: bool,
     ) -> Self {
         // TODO: is this correct rust syntax lol
-        let mut graph = HNSWGraph::<K, D>::new();
+        let graph = HNSWGraph::<K, D>::new();
         HNSWSparseIndex {
             graph: graph,
             entry_point: None,
